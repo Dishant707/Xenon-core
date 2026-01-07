@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "xenon-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "High-performance computational biology library in Rust."
 requires-python = ">=3.8"
 
