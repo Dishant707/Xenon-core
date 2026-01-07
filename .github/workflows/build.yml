@@ -69,8 +69,6 @@ jobs:
           pattern: 'wheels-*'
           path: dist
           merge-multiple: true
-      - name: Debug - List files
-        run: ls -R
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
