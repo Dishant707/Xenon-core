@@ -1,5 +1,7 @@
 # xenon-core 🧬⚡
 
+[![PyPI version](https://badge.fury.io/py/xenon-core.svg)](https://pypi.org/project/xenon-core/)
+
 **High-performance computational biology library in Rust for Python.**
 
 `xenon-core` is a blazingly fast bioinformatics extension that offloads computationally intensive tasks (like K-mer counting) to Rust. It leverages parallel processing (`rayon`), zero-copy memory management, and SIMD vectorization to achieve extreme performance gains over standard Python tools.
