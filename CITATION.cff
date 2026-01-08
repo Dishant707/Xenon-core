@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use Xenon-Core, please cite it."
+title: "Xenon-Core: High-Performance Genomics Suite"
+authors:
+  - family-names: Dishant
+    given-names: Dishant
+version: 0.4.0
+date-released: 2026-01-08
+url: "https://github.com/Dishant707/Xenon-core"
+license: MIT
