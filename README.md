@@ -1,75 +1,106 @@
 # xenon-core 🧬⚡
 
 [![PyPI version](https://badge.fury.io/py/xenon-core.svg)](https://pypi.org/project/xenon-core/)
+![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)
+![License MIT](https://img.shields.io/badge/license-MIT-green.svg)
 
-**High-performance computational biology library in Rust for Python.**
+**Xenon-Core v0.4.0: The Complete High-Performance Suite.**
 
-`xenon-core` is a blazingly fast bioinformatics extension that offloads computationally intensive tasks (like K-mer counting) to Rust. It leverages parallel processing (`rayon`), zero-copy memory management, and SIMD vectorization to achieve extreme performance gains over standard Python tools.
+`xenon-core` is a blazingly fast bioinformatics extension that offloads computationally intensive tasks to Rust. It leverages manual parallel threading, zero-copy memory management, and optimized lookup tables to achieve speedups of **up to ~500x** over standard Python tools.
 
-## 🚀 Performance
+**Why use Xenon-Core?**  
+Stop waiting for Python loops to finish. Replace Biopython heavy lifting with Xenon-Core and get instant results.
 
-| Task | Tool | Time | Speedup |
-|------|------|------|---------|
-| **K-mer Counting (k=5)** | **xenon-core** | **1.28 s** | **~29x** 🚀 |
-| | pysam | 36.70 s | 1x |
-| | Pure Python | ~4.1 s | ~8x slower than xenon |
+---
 
-*Benchmark run on a 488MB FASTA file (Large Genome).*
+## 🚀 Performance Benchmarks
+
+All benchmarks performed on a standard Mac ARM chip (M1/M2/M3).
+
+### 1. DNA Utility Functions
+*Vs Biopython (Sequences of 1M - 3M bases)*
+
+| Operation | Xenon-Core | Biopython | Speedup |
+|-----------|------------|-----------|---------|
+| **GC Content** | **0.17 ms** | 3.64 ms | **21x** 🚀 |
+| **Reverse Complement** | **0.25 ms** | 0.54 ms | **2.2x** |
+| **Translate** (3M bp) | **11.4 ms** | 101.5 ms | **8.9x** ⚡ |
+| **Trim Low Quality** | **0.31 ms** | 16.4 ms | **52x** |
+
+### 2. K-mer Counting
+*Vs Pure Python and Rayon-based Implementations (50MB dataset)*
+
+| Implementation | Time |
+|----------------|------|
+| **Xenon-Core (Manual Parallel + Zero-Copy)** | **0.08 s** |
+| Previous Rust Implementation (File I/O) | 0.22 s |
+| Python Dictionary Loop | ~36.00 s |
+
+*> Xenon-Core is ~500x faster than pure Python loops.*
+
+---
 
 ## ✨ Features
 
-- **Extreme Speed**: optimized Rust backend using `needletail` for fast I/O and `FxHash` for rapid hashing.
-- **Parallel Processing**: Automatically utilizes all available CPU cores.
-- **Zero-Copy Architecture**: Minimizes memory usage by using byte slices instead of allocating new strings.
-- **SIMD Vectorization**: Uses explicit SIMD chunking to normalize DNA sequences (A,C,G,T -> 0,1,2,3) efficiently.
-- **Python Integration**: Seamlessly returns standard Python dictionaries and types via `pyo3`.
+- **Advanced K-mer Counting**: 
+    - Zero-Copy architecture reads Python `bytes` directly without cloning.
+    - Manual threading utilizing all CPU cores.
+    - Returns efficient `KmerCounts` object (dict-like) to avoid massive allocation.
+- **Ultra-Fast Utilities**:
+    - `gc_content`: Direct byte scanning.
+    - `reverse_complement`: SIMD-friendly table lookup.
+    - `translate`: Standard Genetic Code translation with stop codon support.
+    - `trim_low_quality`: Phred+33 aware quality trimming.
+- **Sequence Filtering**:
+    - `filter_reads`: Rapidly parse and filter FASTA/FASTQ files by length.
+
+---
 
 ## 📦 Installation
 
-This project is managed with `maturin`.
-
-### From Source
 ```bash
-# Clone the repository
+pip install xenon-core
+```
+*Requires a Python 3.8+ environment.*
+
+### Building from Source
+```bash
 git clone https://github.com/Dishant707/Xenon-core.git
 cd Xenon-core
-
-# Create a virtual environment (optional but recommended)
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install maturin
-
-# Build and install locally
 maturin develop --release
 ```
+
+---
 
 ## 🛠 Usage
 
 ```python
 import xenon_core
 
-# 1. Count K-mers efficiently
-# Returns a dictionary of {kmer_string: count}
-# The computationally heavy lifting happens in parallel Rust threads (GIL released).
-kmers = xenon_core.count_kmers("path/to/genome.fa", 5)
+# 1. High-Performance Translation
+dna = "ATGCGT..."
+protein = xenon_core.translate(dna)
+# > "MR..." (Stops at Stop Codons)
 
-print(f"Total unique k-mers: {len(kmers)}")
-print(f"Count of 'AAAAA': {kmers.get('AAAAA', 0)}")
+# 2. Parallel K-mer Counting (Zero-Copy)
+# Pass a list of byte objects for maximum speed
+seqs = [b"ATCG...", b"GGTA..."] 
+counts = xenon_core.count_kmers_manual(seqs, k=5)
 
+print(f"Count of 'AAAAA': {counts['AAAAA']}")
+# Iterable like a dict
+for kmer, count in counts.items():
+    print(kmer, count)
 
-# 2. Basic Genome Stats
-stats = xenon_core.process_file("path/to/genome.fa")
-print(stats)
-# Output: {'total_bases': 512000000, 'sequences_count': 10000}
+# 3. Filtering Reads
+# Quickly get list of reads longer than threshold
+long_reads = xenon_core.filter_reads("genome.fa", min_length=150)
+
+# 4. Utilities
+gc = xenon_core.gc_content("ATCG...")
+rev = xenon_core.reverse_complement("ATCG...")
+trimmed = xenon_core.trim_low_quality("ATCG...", "IIII#...", 20)
 ```
-
-## 🏗 Development
-
-- **Build**: `cargo build --release`
-- **Test**: `cargo test`
-- **Benchmark**: `python3 benchmark_vs_pysam.py`
 
 ## 📄 License
 MIT

@@ -2,8 +2,23 @@ use needletail::parse_fastx_file;
 use rayon::prelude::*;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use rustc_hash::FxHashMap;
+
+/// Raw pointer wrapper for zero-copy thread passing
+#[derive(Copy, Clone)]
+struct SeqPtr {
+    ptr: *const u8,
+    len: usize,
+}
+
+// Safety: We ensure the Python object outlives the threads via `py.allow_threads` Scope or by ensuring
+// the list passed to us is not modified (Python strings/bytes are immutable).
+// We are only reading bytes.
+unsafe impl Send for SeqPtr {}
+unsafe impl Sync for SeqPtr {} // Needed if multiple threads read same ptr (not case here, but good practice)
 
 /// A memory-efficient struct to hold processed genome data.
 /// For this simplified example, we'll store a flattened vector of numeric bases.
@@ -233,9 +248,339 @@ fn merge_maps(global: &mut FxHashMap<Vec<u8>, usize>, batch: FxHashMap<&[u8], us
 fn xenon_core(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(process_file, m)?)?;
     m.add_function(wrap_pyfunction!(count_kmers, m)?)?;
+    m.add_function(wrap_pyfunction!(gc_content, m)?)?;
+    m.add_function(wrap_pyfunction!(reverse_complement, m)?)?;
+    m.add_function(wrap_pyfunction!(trim_low_quality, m)?)?;
+    m.add_function(wrap_pyfunction!(count_kmers_manual, m)?)?;
+    m.add_function(wrap_pyfunction!(translate, m)?)?;
+    m.add_function(wrap_pyfunction!(filter_reads, m)?)?;
+    m.add_class::<KmerCounts>()?;
     Ok(())
 }
 
+/// A wrapper around FxHashMap to provide efficient Python access without massive dict conversion.
+#[pyclass]
+struct KmerCounts {
+    inner: FxHashMap<Vec<u8>, usize>,
+}
+
+#[pymethods]
+impl KmerCounts {
+    fn __getitem__(&self, key: &PyAny) -> PyResult<usize> {
+        // Handle both str and bytes keys
+        let key_bytes = if let Ok(s) = key.extract::<String>() {
+            s.into_bytes()
+        } else if let Ok(b) = key.extract::<&[u8]>() {
+            b.to_vec()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err("Key must be str or bytes"));
+        };
+
+        self.inner.get(&key_bytes)
+            .copied()
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Key not found"))
+    }
+
+    fn get(&self, key: &PyAny, default: Option<usize>) -> PyResult<Option<usize>> {
+        match self.__getitem__(key) {
+            Ok(v) => Ok(Some(v)),
+            Err(_) => Ok(default),
+        }
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn keys(&self) -> Vec<String> {
+        // Return keys as strings. This might be heavy if all needed at once,
+        // but user asked for iteration. `__iter__` in python usually iterates keys.
+        self.inner.keys()
+            .map(|k| String::from_utf8_lossy(k).into_owned())
+            .collect()
+    }
+    
+    fn items(&self) -> Vec<(String, usize)> {
+        self.inner.iter()
+            .map(|(k, v)| (String::from_utf8_lossy(k).into_owned(), *v))
+            .collect()
+    }
+
+    fn values(&self) -> Vec<usize> {
+        self.inner.values().copied().collect()
+    }
+}
+
+
+/// Manual parallel K-mer counting using std::thread and zero-copy pointer passing.
+#[pyfunction]
+fn count_kmers_manual(py: Python, sequences: Vec<&PyBytes>, k_size: usize) -> PyResult<KmerCounts> {
+    // 1. Convert Python bytes to strict Raw Pointers (Zero-Copy)
+    // We strictly assume `sequences` list and its elements are kept alive by Python ref counting 
+    // while we are in this function.
+    let ptrs: Vec<SeqPtr> = sequences.iter().map(|bytes| {
+        let slice = bytes.as_bytes();
+        SeqPtr {
+            ptr: slice.as_ptr(),
+            len: slice.len(),
+        }
+    }).collect();
+
+    // 2. Release GIL and compute
+    let global_map = py.allow_threads(move || {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        
+        let chunk_size = (ptrs.len() + num_threads - 1) / num_threads;
+        let chunks: Vec<Vec<SeqPtr>> = ptrs.chunks(chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+            
+        let mut handles = Vec::with_capacity(chunks.len());
+        
+        for chunk in chunks {
+            let handle = thread::spawn(move || {
+                let mut map: FxHashMap<&[u8], usize> = FxHashMap::default();
+                for seq_ptr in chunk {
+                    // Safety: Valid because `sequences` in Python is alive.
+                    let slice = unsafe { 
+                        std::slice::from_raw_parts(seq_ptr.ptr, seq_ptr.len) 
+                    };
+                    
+                    // Lifetime extension hack: We know these pointers are valid until the end of `allow_threads`.
+                    // But `thread::spawn` requires 'static. We lie to the compiler here.
+                    // THIS IS SAFE only because we join() all threads before `allow_threads` returns.
+                    let slice_ref: &'static [u8] = unsafe { std::mem::transmute(slice) };
+
+                    if slice_ref.len() >= k_size {
+                        for kmer in slice_ref.windows(k_size) {
+                            *map.entry(kmer).or_insert(0) += 1;
+                        }
+                    }
+                }
+                map
+            });
+            handles.push(handle);
+        }
+        
+        // 3. Merge Results
+        let mut final_map = FxHashMap::default();
+        for handle in handles {
+            let map = handle.join().unwrap();
+            for (k, v) in map {
+                // Now we allocate the key for the global map
+                *final_map.entry(k.to_vec()).or_insert(0) += v;
+            }
+        }
+        
+        final_map
+    });
+
+    // 4. Return custom struct
+    Ok(KmerCounts { inner: global_map })
+}
+
+/// Calculate GC content percentage of a DNA sequence.
+#[pyfunction]
+pub fn gc_content(sequence: &str) -> f64 {
+    if sequence.is_empty() {
+        return 0.0;
+    }
+    
+    let bytes = sequence.as_bytes();
+    // Optimization: Use bytecount for SIMD acceleration if available (it is a dependency)
+    // We need to count G, C, g, c.
+    // bytecount::count only counts one byte.
+    // Naive filter is slow.
+    // Let's use rayon if length is large, or just a faster loop.
+    // For 1MB, simple iteration with lookup is fastest.
+    
+    // Using a lookup table for "is_gc" is faster than branching matches
+    static GC_TABLE: [bool; 256] = {
+        let mut table = [false; 256];
+        table[b'G' as usize] = true;
+        table[b'C' as usize] = true;
+        table[b'g' as usize] = true;
+        table[b'c' as usize] = true;
+        table
+    };
+
+    let gc_count = bytes.iter().fold(0usize, |acc, &b| {
+        acc + (GC_TABLE[b as usize] as usize)
+    });
+        
+    (gc_count as f64 / sequence.len() as f64) * 100.0
+}
+
+/// Compute the reverse complement of a DNA sequence.
+#[pyfunction]
+pub fn reverse_complement(sequence: &str) -> String {
+    let len = sequence.len();
+    let mut result = vec![0u8; len];
+    let bytes = sequence.as_bytes();
+
+    static COMPLEMENT_TABLE: [u8; 256] = {
+        let mut table = [0; 256];
+        let mut i = 0;
+        while i < 256 {
+            table[i] = i as u8; // Default to self
+            i += 1;
+        }
+        table[b'A' as usize] = b'T'; table[b'a' as usize] = b'T';
+        table[b'C' as usize] = b'G'; table[b'c' as usize] = b'G';
+        table[b'G' as usize] = b'C'; table[b'g' as usize] = b'C';
+        table[b'T' as usize] = b'A'; table[b't' as usize] = b'A';
+        table[b'U' as usize] = b'A'; table[b'u' as usize] = b'A';
+        table[b'N' as usize] = b'N'; table[b'n' as usize] = b'N';
+        table
+    };
+
+    // Fill result in reverse order
+    // Unsafe optimization could be used here for speed, but let's try safe indexing match first.
+    // Actually, simple loop with direct assignment is best.
+    
+    for (i, &b) in bytes.iter().enumerate() {
+        result[len - 1 - i] = COMPLEMENT_TABLE[b as usize];
+    }
+    
+    // Safety: We constructed this from valid ASCII bytes (DNA) and table maps ASCII to ASCII
+    unsafe { String::from_utf8_unchecked(result) }
+}
+
+/// Trim a sequence sequence based on quality scores (Phred+33).
+/// Returns a new string containing the high-quality prefix.
+#[pyfunction]
+pub fn trim_low_quality(sequence: &str, quality_scores: &str, threshold: u8) -> String {
+    let cutoff = threshold.saturating_add(33);
+    let len = sequence.len().min(quality_scores.len());
+    let mut trim_end = len;
+    
+    // Find the first position where quality drops below threshold
+    for (i, &q) in quality_scores.as_bytes()[..len].iter().enumerate() {
+        if q < cutoff {
+            trim_end = i;
+            break;
+        }
+    }
+    
+    sequence[..trim_end].to_string()
+}
+
+/// Translate DNA sequence to Protein sequence (Standard Genetic Code).
+/// Stops at stop codons. Ignores trailing partial codons.
+#[pyfunction]
+pub fn translate(dna_sequence: &str) -> String {
+    let bytes = dna_sequence.as_bytes();
+    let mut protein = String::with_capacity(bytes.len() / 3);
+
+    for chunk in bytes.chunks_exact(3) {
+        let codon_str = unsafe { std::str::from_utf8_unchecked(chunk) };
+        let aa = match codon_str {
+            "TTT" | "TTC" => 'F',
+            "TTA" | "TTG" | "CTT" | "CTC" | "CTA" | "CTG" => 'L',
+            "ATT" | "ATC" | "ATA" => 'I',
+            "MET" | "ATG" => 'M', // ATG is Start/Met
+            "GTT" | "GTC" | "GTA" | "GTG" => 'V',
+            "TCT" | "TCC" | "TCA" | "TCG" => 'S',
+            "CCT" | "CCC" | "CCA" | "CCG" => 'P',
+            "ACT" | "ACC" | "ACA" | "ACG" => 'T',
+            "GCT" | "GCC" | "GCA" | "GCG" => 'A',
+            "TAT" | "TAC" => 'Y',
+            "CAT" | "CAC" => 'H',
+            "CAA" | "CAG" => 'Q',
+            "AAT" | "AAC" => 'N',
+            "AAA" | "AAG" => 'K',
+            "GAT" | "GAC" => 'D',
+            "GAA" | "GAG" => 'E',
+            "TGT" | "TGC" => 'C',
+            "TGG" => 'W',
+            "CGT" | "CGC" | "CGA" | "CGG" | "AGA" | "AGG" => 'R',
+            "AGT" | "AGC" => 'S',
+            "GGT" | "GGC" | "GGA" | "GGG" => 'G',
+            "TAA" | "TAG" | "TGA" => break, // Stop codons
+            _ => 'X', // Unknown
+        };
+        protein.push(aa);
+    }
+    protein
+}
+
+/// Filter reads from a FASTA/FASTQ file by minimum length.
+/// Returns a list of sequences.
+#[pyfunction]
+pub fn filter_reads(file_path: String, min_length: usize) -> PyResult<Vec<String>> {
+    let mut reader = parse_fastx_file(&file_path).map_err(|e| {
+        pyo3::exceptions::PyIOError::new_err(format!("Failed to open file: {}", e))
+    })?;
+
+    let mut filtered_seqs = Vec::new();
+    
+    while let Some(record) = reader.next() {
+        let record = record.map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("Error reading record: {}", e))
+        })?;
+        
+        let seq = record.seq();
+        if seq.len() >= min_length {
+            // We usually want the sequence as string for Python
+            let seq_str = String::from_utf8_lossy(&seq).into_owned();
+            filtered_seqs.push(seq_str);
+        }
+    }
+    
+    Ok(filtered_seqs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    // ... existing tests ...
+
+    #[test]
+    fn test_translate() {
+        assert_eq!(translate("ATGCGT"), "MR".to_string());
+        assert_eq!(translate("ATGCGTTAA"), "MR".to_string()); // Stop at TAA
+        assert_eq!(translate("ATGCG"), "M".to_string()); // Partial at end ignored (ATGCG -> ATG, CG ignored)
+        // Wait, standard behavior for chunks_exact is ignore remainder. 
+        // ATG (M), CG (ignored). Correct.
+        
+        // Test stop codons
+        assert_eq!(translate("TAG"), "".to_string());
+        assert_eq!(translate("TGA"), "".to_string());
+    }
+
+
+    #[test]
+    fn test_gc_content() {
+        assert_eq!(gc_content("GCGC"), 100.0);
+        assert_eq!(gc_content("ATAT"), 0.0);
+        assert_eq!(gc_content("GATC"), 50.0);
+        assert_eq!(gc_content(""), 0.0);
+        assert_eq!(gc_content("gaTc"), 50.0); 
+    }
+
+    #[test]
+    fn test_reverse_complement() {
+        assert_eq!(reverse_complement("GTCA"), "TGAC".to_string());
+        assert_eq!(reverse_complement("aaaa"), "TTTT".to_string());
+        assert_eq!(reverse_complement(""), "".to_string());
+        assert_eq!(reverse_complement("N"), "N".to_string());
+    }
+
+    #[test]
+    fn test_trim_low_quality() {
+        // Phred+33: 'I' = 73 (40), '#' = 35 (2)
+        // Threshold 20 -> Cutoff 53
+        let seq = "ACGTACGT";
+        let qual = "IIII#III"; // Drop at index 4 (#)
+        assert_eq!(trim_low_quality(seq, qual, 20), "ACGT".to_string());
+        
+        let qual_good = "IIIIIIII";
+        assert_eq!(trim_low_quality(seq, qual_good, 20), "ACGTACGT".to_string());
+    }
+}
 #[pyfunction]
 fn process_file(py: Python, file_path: String) -> PyResult<PyObject> {
     // process_genome_parallel is "safe enough" to call directly given our usage patterns
